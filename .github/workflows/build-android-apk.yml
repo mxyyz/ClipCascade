@@ -1,9 +1,12 @@
 name: Build Android APK
 
-# Publishing a release builds the APK and attaches it to that release. The manual
-# trigger builds the same APK on demand; pass a tag to also attach it to an existing
-# release, or leave it empty to just keep the build artifact.
+# Every merge to main builds the APK and keeps it as a build artifact, so a broken
+# build surfaces at merge time rather than when a release is cut. Publishing a
+# release builds it again and attaches it to that release. The manual trigger builds
+# on demand; pass a tag to also attach it to an existing release.
 on:
+  push:
+    branches: [main]
   release:
     types: [published]
   workflow_dispatch:
@@ -18,7 +21,9 @@ permissions:
 
 concurrency:
   group: build-android-apk-${{ github.event.release.tag_name || github.ref }}
-  cancel-in-progress: false
+  # Superseded merges can be dropped; a release build must always finish, since its
+  # APK is the release asset.
+  cancel-in-progress: ${{ github.event_name == 'push' }}
 
 jobs:
   build:
