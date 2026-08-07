@@ -82,8 +82,8 @@ android {
         applicationId "com.clipcascade"
         minSdkVersion 26
         targetSdkVersion rootProject.ext.targetSdkVersion
-        versionCode 1
-        versionName "1.0"
+        versionCode project.hasProperty('appVersionCode') ? appVersionCode.toInteger() : 1
+        versionName project.hasProperty('appVersionName') ? appVersionName : "1.0"
     }
     signingConfigs {
         debug {

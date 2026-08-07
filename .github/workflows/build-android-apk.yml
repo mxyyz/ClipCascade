@@ -76,6 +76,71 @@ jobs:
             echo "signed=true" >> "$GITHUB_OUTPUT"
           fi
 
+      # Resolved before the build so the APK carries the version of the release it
+      # ships in. Nothing version-related is committed: app/build.gradle defaults to
+      # upstream's 1.0/1 and only overrides them when these properties are passed,
+      # which keeps the working tree mergeable with upstream.
+      #
+      # versionCode is derived from the tag rather than a CI counter, so rebuilding a
+      # tag reproduces the same number and the number itself says which upstream
+      # release the build is based on:
+      #   major*1000000 + minor*10000 + patch*100 + fork build
+      #   3.2.0-mxyyz.1 -> 3020001, 3.2.0-mxyyz.2 -> 3020002, 3.3.0-mxyyz.1 -> 3030001
+      - name: Resolve version
+        id: version
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+        run: |
+          set -euo pipefail
+
+          TAG="${RELEASE_TAG:-$INPUT_TAG}"
+          if [ -n "$TAG" ]; then
+            ATTACH=true
+          else
+            # Untagged build (a push to main, or a manual run with no tag): fall back
+            # to the version the tree declares, and attach it to nothing.
+            TAG="$(jq -r .android version.json)"
+            ATTACH=false
+          fi
+
+          NAME="${TAG#v}"        # tolerate an optional leading v
+          CORE="${NAME%%-*}"     # 3.2.0 out of 3.2.0-mxyyz.1
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$CORE"
+
+          for part in "$MAJOR" "$MINOR" "$PATCH"; do
+            case "$part" in
+              ''|*[!0-9]*)
+                echo "::error::Tag '$TAG' is not major.minor.patch[-suffix.N]; cannot derive a versionCode"
+                exit 1 ;;
+            esac
+          done
+
+          # Trailing .N of the suffix is the fork build number; anything else is 0.
+          FORK=0
+          case "$NAME" in
+            *-*)
+              CANDIDATE="${NAME##*.}"
+              case "$CANDIDATE" in
+                ''|*[!0-9]*) FORK=0 ;;
+                *)           FORK="$CANDIDATE" ;;
+              esac ;;
+          esac
+          if [ "$FORK" -gt 99 ]; then
+            echo "::error::Fork build number $FORK exceeds the 99 reserved per upstream release"
+            exit 1
+          fi
+
+          CODE=$(( MAJOR * 1000000 + MINOR * 10000 + PATCH * 100 + FORK ))
+
+          {
+            echo "tag=$TAG"
+            echo "name=$NAME"
+            echo "code=$CODE"
+            echo "attach=$ATTACH"
+          } >> "$GITHUB_OUTPUT"
+          echo "Building **$NAME** (versionCode \`$CODE\`)" >> "$GITHUB_STEP_SUMMARY"
+
       - name: Build release APK
         working-directory: ClipCascade_Mobile/src/android
         env:
@@ -83,27 +148,30 @@ jobs:
           STORE_PASS: ${{ secrets.RELEASE_STORE_PASSWORD }}
           KEY_PASS: ${{ secrets.RELEASE_KEY_PASSWORD }}
           KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
+          VERSION_NAME: ${{ steps.version.outputs.name }}
+          VERSION_CODE: ${{ steps.version.outputs.code }}
         run: |
           # gradlew is tracked with mode 0644, so it is not executable on checkout.
           chmod +x gradlew
+          set -- --no-daemon assembleRelease \
+            -PappVersionName="$VERSION_NAME" \
+            -PappVersionCode="$VERSION_CODE"
           if [ "$SIGNED" = "true" ]; then
-            ./gradlew --no-daemon assembleRelease \
+            set -- "$@" \
               -PMYAPP_UPLOAD_STORE_FILE="$RUNNER_TEMP/release.keystore" \
               -PMYAPP_UPLOAD_STORE_PASSWORD="$STORE_PASS" \
               -PMYAPP_UPLOAD_KEY_ALIAS="$KEY_ALIAS" \
               -PMYAPP_UPLOAD_KEY_PASSWORD="$KEY_PASS"
-          else
-            ./gradlew --no-daemon assembleRelease
           fi
+          ./gradlew "$@"
 
-      # Tag names reach this step as environment variables rather than as ${{ }}
+      # Values reach this step as environment variables rather than as ${{ }}
       # interpolated into the script, so a tag containing shell metacharacters is
       # data instead of code.
       - name: Collect and name the APK
         id: apk
         env:
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
-          INPUT_TAG: ${{ github.event.inputs.tag }}
+          VERSION_NAME: ${{ steps.version.outputs.name }}
         run: |
           set -euo pipefail
           OUT=ClipCascade_Mobile/src/android/app/build/outputs/apk/release
@@ -114,21 +182,11 @@ jobs:
             exit 1
           fi
 
-          TAG="${RELEASE_TAG:-$INPUT_TAG}"
-          if [ -z "$TAG" ]; then
-            TAG="v$(jq -r .android version.json)"
-            ATTACH=false
-          else
-            ATTACH=true
-          fi
-
-          # Keep the tag usable as a file name component.
-          SAFE_TAG=$(printf '%s' "$TAG" | tr -c 'A-Za-z0-9._-' '_')
-          NAME="ClipCascade-${SAFE_TAG}-android.apk"
+          # Keep the version usable as a file name component.
+          SAFE=$(printf '%s' "$VERSION_NAME" | tr -c 'A-Za-z0-9._-' '_')
+          NAME="ClipCascade-${SAFE}-android.apk"
           cp "$APK" "$NAME"
           echo "path=$NAME" >> "$GITHUB_OUTPUT"
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "attach=$ATTACH" >> "$GITHUB_OUTPUT"
 
       - name: Verify the APK signature
         if: steps.keystore.outputs.signed == 'true'
@@ -145,9 +203,9 @@ jobs:
           if-no-files-found: error
 
       - name: Attach the APK to the release
-        if: steps.apk.outputs.attach == 'true'
+        if: steps.version.outputs.attach == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ steps.apk.outputs.tag }}
+          TAG: ${{ steps.version.outputs.tag }}
           APK_PATH: ${{ steps.apk.outputs.path }}
         run: gh release upload "$TAG" "$APK_PATH" --clobber
